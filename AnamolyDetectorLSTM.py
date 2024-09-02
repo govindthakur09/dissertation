@@ -1,16 +1,18 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_curve, auc, precision_recall_curve
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
-from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# Suppress TensorFlow logging
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import tensorflow as tf  # Import TensorFlow
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
+from sklearn.model_selection import train_test_split
 
 # Load the datasets
 input_file = 'SourceDataSet_AllRecord_FromSource.csv'
@@ -35,54 +37,71 @@ def preprocess_data(df, scaler=None):
 # Preprocess input data
 input_data, input_scaler = preprocess_data(input_df)
 
-# Add noise to the data for training
-def add_noise(data, noise_factor=0.1):
-    noise = np.random.normal(loc=0.0, scale=noise_factor, size=data.shape)
-    noisy_data = data + noise
-    return np.clip(noisy_data, 0., 1.)  # Ensure values are in the range [0, 1]
-
-noisy_input_data = add_noise(input_data, noise_factor=0.1)
-
-# Define the denoising autoencoder model
+# Define sequence parameters
+time_steps = 10  # Number of previous time steps to consider
 input_dim = input_data.shape[1]
-encoding_dim = 14  # Can be adjusted
 
-input_layer = Input(shape=(input_dim,))
-encoder = Dense(encoding_dim, activation="relu")(input_layer)
-decoder = Dense(input_dim, activation="sigmoid")(encoder)
+# Split data into training and validation sets
+train_data, val_data = train_test_split(input_data, test_size=0.2, shuffle=False)
 
-autoencoder = Model(inputs=input_layer, outputs=decoder)
-autoencoder.compile(optimizer=Adam(learning_rate=0.00001), loss='mean_squared_error')
+# Generate time series data for LSTM
+train_generator = TimeseriesGenerator(train_data, train_data, length=time_steps, batch_size=32)
+val_generator = TimeseriesGenerator(val_data, val_data, length=time_steps, batch_size=32)
 
-# Train the denoising autoencoder
-autoencoder.fit(noisy_input_data, input_data, epochs=1000, batch_size=50, shuffle=True, validation_split=0.2)
+# Define the LSTM model with increased complexity
+model = Sequential()
+model.add(LSTM(units=128, return_sequences=True, input_shape=(time_steps, input_dim)))
+model.add(Dropout(0.3))
+model.add(LSTM(units=64, return_sequences=False))
+model.add(Dropout(0.3))
+model.add(Dense(units=64, activation='relu'))
+model.add(Dense(units=input_dim, activation='sigmoid'))
+
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+
+# Add EarlyStopping to avoid overfitting
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+# Train the LSTM model
+model.fit(train_generator, epochs=10, shuffle=True, validation_data=val_generator, callbacks=[early_stopping])
 
 # Preprocess subset data using the same scaler
 subset_data, _ = preprocess_data(subset_df, scaler=input_scaler)
 
-# Predict using the autoencoder
-reconstructed_data = autoencoder.predict(subset_data)
+# Generate time series data for the subset
+subset_generator = TimeseriesGenerator(subset_data, subset_data, length=time_steps, batch_size=32)
 
-# Calculate the reconstruction error
-reconstruction_error = np.mean(np.power(subset_data - reconstructed_data, 2), axis=1)
+# Predict using the LSTM model
+reconstructed_data = model.predict(subset_generator)
 
-# Set a threshold for anomaly detection
+# Calculate the reconstruction error for each sequence
+reconstruction_error = []
+for i in range(len(subset_generator)):
+    seq_true = subset_generator[i][1]  # True sequence
+    seq_pred = reconstructed_data[i]   # Predicted sequence
+    error = np.mean(np.square(seq_true - seq_pred))  # Use squared error
+    reconstruction_error.append(error)
+
+reconstruction_error = np.array(reconstruction_error)
+
+# Set a threshold for anomaly detection based on the 95th percentile
 threshold = np.percentile(reconstruction_error, 85)
 
 # Identify anomalies
 anomalies = reconstruction_error > threshold
-anomalous_data = subset_df[anomalies]
+anomalous_data_indices = np.where(anomalies)[0]
+
+# Get the actual anomalous data from the subset
+anomalous_data = subset_df.iloc[anomalous_data_indices + time_steps]  # Adjust for time_steps offset
 
 print(f"Anomalies detected:\n{anomalous_data}")
 
-print(f"Number of anomalies detected: {len(anomalous_data)}")
-
 # Save anomalies to a file if needed
-anomalous_data.to_csv('denoising_anomalies.csv', index=False)
+anomalous_data.to_csv('anomalies_lstm.csv', index=False)
 
 # Assuming true labels are available; you need to define how to get them
 # For this example, we'll create a dummy true_labels array as an example
-true_labels = np.zeros(len(subset_df))  # Replace with actual true labels
+true_labels = np.zeros(len(reconstruction_error))  # Replace with actual true labels
 true_labels[anomalies] = 1  # Assuming anomalies in subset_df are the true anomalies
 
 # Convert anomalies boolean array to integer array

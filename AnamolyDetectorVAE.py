@@ -1,16 +1,16 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_curve, auc, precision_recall_curve
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.layers import Input, Dense, Lambda, Layer
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import backend as K
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# Suppress TensorFlow logging
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Load the datasets
 input_file = 'SourceDataSet_AllRecord_FromSource.csv'
@@ -35,33 +35,67 @@ def preprocess_data(df, scaler=None):
 # Preprocess input data
 input_data, input_scaler = preprocess_data(input_df)
 
-# Add noise to the data for training
-def add_noise(data, noise_factor=0.1):
-    noise = np.random.normal(loc=0.0, scale=noise_factor, size=data.shape)
-    noisy_data = data + noise
-    return np.clip(noisy_data, 0., 1.)  # Ensure values are in the range [0, 1]
-
-noisy_input_data = add_noise(input_data, noise_factor=0.1)
-
-# Define the denoising autoencoder model
+# Define the VAE model
 input_dim = input_data.shape[1]
-encoding_dim = 14  # Can be adjusted
+latent_dim = 14  # Dimensionality of the latent space, can be adjusted
+intermediate_dim = 32  # Can be adjusted based on the complexity of your data
 
-input_layer = Input(shape=(input_dim,))
-encoder = Dense(encoding_dim, activation="relu")(input_layer)
-decoder = Dense(input_dim, activation="sigmoid")(encoder)
+# Encoder
+inputs = Input(shape=(input_dim,))
+h = Dense(intermediate_dim, activation='relu')(inputs)
+z_mean = Dense(latent_dim)(h)
+z_log_var = Dense(latent_dim)(h)
 
-autoencoder = Model(inputs=input_layer, outputs=decoder)
-autoencoder.compile(optimizer=Adam(learning_rate=0.00001), loss='mean_squared_error')
+# Sampling function for the latent space
+def sampling(args):
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
 
-# Train the denoising autoencoder
-autoencoder.fit(noisy_input_data, input_data, epochs=1000, batch_size=50, shuffle=True, validation_split=0.2)
+# Latent space
+z = Lambda(sampling, output_shape=(latent_dim,))([z_mean, z_log_var])
+
+# Decoder
+decoder_h = Dense(intermediate_dim, activation='relu')
+decoder_mean = Dense(input_dim, activation='sigmoid')
+h_decoded = decoder_h(z)
+x_decoded_mean = decoder_mean(h_decoded)
+
+# Custom loss layer
+class VAELossLayer(Layer):
+    def __init__(self, **kwargs):
+        super(VAELossLayer, self).__init__(**kwargs)
+
+    def vae_loss(self, inputs, x_decoded_mean, z_log_var, z_mean):
+        reconstruction_loss = K.sum(K.square(inputs - x_decoded_mean), axis=-1)
+        kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
+        kl_loss = K.sum(kl_loss, axis=-1)
+        kl_loss *= -0.5
+        return K.mean(reconstruction_loss + kl_loss)
+
+    def call(self, inputs):
+        inputs, x_decoded_mean, z_log_var, z_mean = inputs
+        loss = self.vae_loss(inputs, x_decoded_mean, z_log_var, z_mean)
+        self.add_loss(loss)
+        return x_decoded_mean  # Return the output of the decoder
+
+# Define the VAE model with custom loss layer
+outputs = VAELossLayer()([inputs, x_decoded_mean, z_log_var, z_mean])
+vae = Model(inputs, outputs)
+
+# Compile the model without specifying the loss
+vae.compile(optimizer=Adam(learning_rate=0.00001))
+
+# Train the VAE
+vae.fit(input_data, input_data, epochs=10, batch_size=50, shuffle=True, validation_split=0.2)
 
 # Preprocess subset data using the same scaler
 subset_data, _ = preprocess_data(subset_df, scaler=input_scaler)
 
-# Predict using the autoencoder
-reconstructed_data = autoencoder.predict(subset_data)
+# Predict using the VAE
+reconstructed_data = vae.predict(subset_data)
 
 # Calculate the reconstruction error
 reconstruction_error = np.mean(np.power(subset_data - reconstructed_data, 2), axis=1)
@@ -75,10 +109,8 @@ anomalous_data = subset_df[anomalies]
 
 print(f"Anomalies detected:\n{anomalous_data}")
 
-print(f"Number of anomalies detected: {len(anomalous_data)}")
-
 # Save anomalies to a file if needed
-anomalous_data.to_csv('denoising_anomalies.csv', index=False)
+anomalous_data.to_csv('anomalies_vae.csv', index=False)
 
 # Assuming true labels are available; you need to define how to get them
 # For this example, we'll create a dummy true_labels array as an example

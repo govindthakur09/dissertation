@@ -1,16 +1,16 @@
 import os
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_curve, auc, precision_recall_curve
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
-from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# Suppress TensorFlow logging
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from pgmpy.models import BayesianNetwork
+from pgmpy.estimators import MaximumLikelihoodEstimator
+from pgmpy.inference import VariableElimination
 
 # Load the datasets
 input_file = 'SourceDataSet_AllRecord_FromSource.csv'
@@ -23,62 +23,69 @@ subset_df = pd.read_csv(subset_file)
 assert list(input_df.columns) == list(subset_df.columns), "Input and subset dataframes must have the same columns"
 
 # Preprocess the data: Fill missing values and standardize
-def preprocess_data(df, scaler=None):
+def preprocess_data(df, scaler=None, discretizer=None):
     df.fillna(0, inplace=True)  # Fill missing values with 0 or use any other strategy
     if scaler:
         scaled_df = scaler.transform(df)
     else:
         scaler = StandardScaler()
         scaled_df = scaler.fit_transform(df)
-    return scaled_df, scaler
+
+    if discretizer:
+        discretized_df = discretizer.transform(scaled_df)
+    else:
+        discretizer = KBinsDiscretizer(n_bins=10, encode='ordinal', strategy='uniform')
+        discretized_df = discretizer.fit_transform(scaled_df)
+
+    return discretized_df, scaler, discretizer
 
 # Preprocess input data
-input_data, input_scaler = preprocess_data(input_df)
+input_data, input_scaler, input_discretizer = preprocess_data(input_df)
 
-# Add noise to the data for training
-def add_noise(data, noise_factor=0.1):
-    noise = np.random.normal(loc=0.0, scale=noise_factor, size=data.shape)
-    noisy_data = data + noise
-    return np.clip(noisy_data, 0., 1.)  # Ensure values are in the range [0, 1]
+# Convert the standardized and discretized data back to a DataFrame for Bayesian Network processing
+input_data_df = pd.DataFrame(input_data, columns=input_df.columns)
 
-noisy_input_data = add_noise(input_data, noise_factor=0.1)
+# Create a Bayesian Network structure based on actual column names
+columns = input_data_df.columns
+model_structure = [(columns[i], columns[i + 1]) for i in range(len(columns) - 1)]
+model = BayesianNetwork(model_structure)
 
-# Define the denoising autoencoder model
-input_dim = input_data.shape[1]
-encoding_dim = 14  # Can be adjusted
+# Estimate the parameters using Maximum Likelihood Estimator
+model.fit(input_data_df, estimator=MaximumLikelihoodEstimator)
 
-input_layer = Input(shape=(input_dim,))
-encoder = Dense(encoding_dim, activation="relu")(input_layer)
-decoder = Dense(input_dim, activation="sigmoid")(encoder)
+# Perform inference
+inference = VariableElimination(model)
 
-autoencoder = Model(inputs=input_layer, outputs=decoder)
-autoencoder.compile(optimizer=Adam(learning_rate=0.00001), loss='mean_squared_error')
+# Detect anomalies in the subset data
+subset_data, _, _ = preprocess_data(subset_df, scaler=input_scaler, discretizer=input_discretizer)
+subset_data_df = pd.DataFrame(subset_data, columns=subset_df.columns)
 
-# Train the denoising autoencoder
-autoencoder.fit(noisy_input_data, input_data, epochs=1000, batch_size=50, shuffle=True, validation_split=0.2)
+# Calculate the joint probability of the evidence for each row in the subset data
+anomaly_scores = []
+for index, row in subset_data_df.iterrows():
+    # Calculate the joint probability of the evidence
+    joint_prob = 1.0
+    for var in model.nodes():
+        # Exclude the variable itself from the evidence
+        evidence = {k: v for k, v in row.to_dict().items() if k != var}
+        prob_dist = inference.query(variables=[var], evidence=evidence)
+        joint_prob *= prob_dist.values[0]  # Get the probability for the evidence
+    anomaly_scores.append(joint_prob)
 
-# Preprocess subset data using the same scaler
-subset_data, _ = preprocess_data(subset_df, scaler=input_scaler)
+# Convert anomaly scores to a numpy array for thresholding
+anomaly_scores = np.array(anomaly_scores)
 
-# Predict using the autoencoder
-reconstructed_data = autoencoder.predict(subset_data)
-
-# Calculate the reconstruction error
-reconstruction_error = np.mean(np.power(subset_data - reconstructed_data, 2), axis=1)
-
-# Set a threshold for anomaly detection
-threshold = np.percentile(reconstruction_error, 85)
+# Set a threshold for anomaly detection (lower joint probability indicates an anomaly)
+threshold = np.percentile(anomaly_scores, 85)  # Use a lower percentile for anomaly detection
 
 # Identify anomalies
-anomalies = reconstruction_error > threshold
+anomalies = anomaly_scores < threshold
 anomalous_data = subset_df[anomalies]
 
 print(f"Anomalies detected:\n{anomalous_data}")
 
-print(f"Number of anomalies detected: {len(anomalous_data)}")
-
 # Save anomalies to a file if needed
-anomalous_data.to_csv('denoising_anomalies.csv', index=False)
+anomalous_data.to_csv('anomalies_bn.csv', index=False)
 
 # Assuming true labels are available; you need to define how to get them
 # For this example, we'll create a dummy true_labels array as an example
@@ -113,7 +120,7 @@ plt.ylabel('True Label')
 plt.show()
 
 # ROC Curve and AUC
-fpr, tpr, _ = roc_curve(true_labels, reconstruction_error)
+fpr, tpr, _ = roc_curve(true_labels, anomaly_scores)
 roc_auc = auc(fpr, tpr)
 
 plt.figure(figsize=(8, 6))
@@ -128,7 +135,7 @@ plt.legend(loc='lower right')
 plt.show()
 
 # Precision-Recall Curve
-precision_vals, recall_vals, _ = precision_recall_curve(true_labels, reconstruction_error)
+precision_vals, recall_vals, _ = precision_recall_curve(true_labels, anomaly_scores)
 
 plt.figure(figsize=(8, 6))
 plt.plot(recall_vals, precision_vals, lw=2, color='purple')
